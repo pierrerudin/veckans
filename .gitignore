@@ -55,3 +55,9 @@ Thumbs.db
 
 # Data
 *.parquet
+*.sql
+*.xlsx
+*.xls
+*.json
+*.pickle
+*.pkl
