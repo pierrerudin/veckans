@@ -1,0 +1,11 @@
+pandas
+numpy
+pandera
+azure-storage-file-datalake
+pyarrow
+deltalake
+adlfs
+fsspec  
+openpyxl
+lightgbm
+scikit-learn

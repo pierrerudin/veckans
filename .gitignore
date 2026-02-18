@@ -1,0 +1,57 @@
+# Byte-compiled / cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+env/
+venv/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Poetry
+poetry.lock.*
+.cache/
+
+# Unit test / coverage reports
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints
+
+# Logs
+*.log
+
+# dotenv environment variables
+.env
+.env.*
+*.csv
+
+# Docker
+*.pid
+*.tar
+*.bak
+.dockerignore
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+
+# System
+.DS_Store
+Thumbs.db
+
+# Data
+*.parquet
