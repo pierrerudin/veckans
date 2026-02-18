@@ -68,7 +68,14 @@ def select_item_unit_conversion(df_items: pd.DataFrame) -> pd.DataFrame:
     df_items['itemUnitConversion'] = df_items.apply(determine_conversion, axis=1)
     logging.info("Item unit conversions selected.")
 
-    return df_items[['itemId', 'itemDesc', 'itemSkey', 'baseItemId', 'cluster1To1Id', 'itemUnitConversion']]
+    keep_cols = ['itemId', 'itemDesc', 'itemSkey', 'baseItemId', 'cluster1To1Id', 'itemUnitConversion']
+    # Preserve category hierarchy columns if present
+    for lvl in range(1, 5):
+        for suffix in ['Id', 'Desc']:
+            col = f'categoryLevel{lvl}{suffix}'
+            if col in df_items.columns:
+                keep_cols.append(col)
+    return df_items[keep_cols]
 
 def convert_order_itemIds_to_baseItemIds(df_orders: pd.DataFrame, df_items: pd.DataFrame) -> pd.DataFrame:
     """
@@ -367,7 +374,7 @@ def fill_missing_weeks(df: pd.DataFrame, id_col: str) -> pd.DataFrame:
     other_cols = ['cluster1To1Id', 'campaignId']
     for col in other_cols:
         if col in df_complete.columns:
-            df_complete[col] = df_complete.groupby(id_col)[col].fillna(method='ffill')
+            df_complete[col] = df_complete.groupby(id_col)[col].ffill()
     
     original_rows = len(df)
     filled_rows = len(df_complete)
@@ -454,10 +461,7 @@ def add_lag_features(df: pd.DataFrame, id_col: str, forecast_horizon_weeks: int 
         # Rolling 4-week average ending at this lag distance
         df[f'sales_rolling_4w_week{week_num}'] = (
             df.groupby(id_col)[target_col]
-            .shift(lag_distance)
-            .rolling(window=4, min_periods=1)
-            .mean()
-            .reset_index(level=0, drop=True)
+            .transform(lambda x: x.shift(lag_distance).rolling(window=4, min_periods=1).mean())
         )
         
         # Fill NaN with 0 for missing lags (new items, early weeks)
@@ -612,6 +616,144 @@ def add_campaign_metadata_to_clusters(df_cluster_weekly: pd.DataFrame, df_item_w
     
     return df
 
+def add_category_lift_features(df_item_weekly: pd.DataFrame, df_items: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add category-level campaign lift priors with hierarchical shrinkage.
+
+    For each item-week, computes the historical average campaign lift at each
+    category level (L1-L4). Items that have never been on campaign get the
+    category average as a prior — this is the main benefit for cold-start items.
+
+    Features added:
+    - cat_lift_l1 .. cat_lift_l4: mean log-lift at each category level
+    - cat_n_obs_l4: number of historical campaign observations at L4
+    - best_cat_lift: shrinkage-weighted best estimate across levels
+    - weeks_since_last_campaign_l4: weeks since last campaign in same L4 category
+    - n_campaigns_historical_l4: number of historical campaigns in same L4 category
+
+    Uses hierarchical shrinkage: trusts L4 (most specific) when enough data exists,
+    falls back towards L3 -> L2 -> L1 as observations decrease.
+    """
+    logging.info("Adding category-level campaign lift features...")
+
+    cat_cols = [f'categoryLevel{lvl}Id' for lvl in range(1, 5)]
+    # Check category columns exist
+    available_cat_cols = [c for c in cat_cols if c in df_items.columns]
+    if not available_cat_cols:
+        logging.warning("  No category columns found in item data, skipping category features")
+        for col in ['cat_lift_l1', 'cat_lift_l2', 'cat_lift_l3', 'cat_lift_l4',
+                     'cat_n_obs_l4', 'best_cat_lift',
+                     'weeks_since_last_campaign_l4', 'n_campaigns_historical_l4']:
+            df_item_weekly[col] = 0
+        return df_item_weekly
+
+    # Map items to categories
+    item_cat = df_items[['baseItemId'] + available_cat_cols].drop_duplicates(subset='baseItemId')
+    df = df_item_weekly.merge(item_cat, on='baseItemId', how='left')
+
+    # Identify campaign weeks and compute per-item-week lift
+    # Lift = salesQuantityKgL_log during campaign vs median baseline for that item
+    campaign_mask = (
+        (df['campaign_week_1'] == 1) |
+        (df['campaign_week_2'] == 1) |
+        (df['campaign_week_3'] == 1)
+    )
+    baseline_mask = df['campaign_week_0'] == 1
+
+    # Item baseline median (already computed as part of normalization, but we use the log values)
+    item_baseline = df[baseline_mask].groupby('baseItemId')['salesQuantityKgL_log'].median()
+    item_baseline.name = 'item_baseline_log'
+
+    # Campaign observations with lift
+    df_campaign = df[campaign_mask].copy()
+    df_campaign = df_campaign.merge(item_baseline, on='baseItemId', how='left')
+    df_campaign['lift_log'] = df_campaign['salesQuantityKgL_log'] - df_campaign['item_baseline_log']
+
+    # Compute mean lift at each category level
+    cat_lift_maps = {}
+    for lvl in range(1, 5):
+        col = f'categoryLevel{lvl}Id'
+        if col not in df_campaign.columns:
+            continue
+        cat_lift = df_campaign.groupby(col)['lift_log'].agg(['mean', 'count']).reset_index()
+        cat_lift.columns = [col, f'cat_lift_l{lvl}', f'cat_n_obs_l{lvl}']
+        cat_lift_maps[lvl] = cat_lift
+
+    # Merge category lifts back to main dataframe
+    for lvl in range(1, 5):
+        col = f'categoryLevel{lvl}Id'
+        if lvl in cat_lift_maps and col in df.columns:
+            df = df.merge(cat_lift_maps[lvl], on=col, how='left')
+            df[f'cat_lift_l{lvl}'] = df[f'cat_lift_l{lvl}'].fillna(0)
+            df[f'cat_n_obs_l{lvl}'] = df[f'cat_n_obs_l{lvl}'].fillna(0)
+        else:
+            df[f'cat_lift_l{lvl}'] = 0
+            df[f'cat_n_obs_l{lvl}'] = 0
+
+    # Hierarchical shrinkage: blend L4 -> L3 -> L2 -> L1
+    # Trust more specific levels when they have enough observations
+    # Shrinkage weight = n_obs / (n_obs + shrinkage_strength)
+    SHRINKAGE_STRENGTH = 10  # need ~10 observations to fully trust a category level
+    df['best_cat_lift'] = df['cat_lift_l1']  # start with broadest
+    for lvl in [2, 3, 4]:
+        weight = df[f'cat_n_obs_l{lvl}'] / (df[f'cat_n_obs_l{lvl}'] + SHRINKAGE_STRENGTH)
+        df['best_cat_lift'] = (1 - weight) * df['best_cat_lift'] + weight * df[f'cat_lift_l{lvl}']
+
+    # Category-level campaign recency and frequency (at L4 level)
+    if 'categoryLevel4Id' in df.columns:
+        # For each category-week: weeks since last campaign in that category
+        campaign_cat_weeks = df_campaign[['categoryLevel4Id', 'week_start']].drop_duplicates()
+        campaign_cat_weeks = campaign_cat_weeks.sort_values('week_start')
+
+        # Build a lookup: for each (category, week), find the most recent campaign week
+        cat_campaign_history = {}
+        for cat_id in campaign_cat_weeks['categoryLevel4Id'].unique():
+            cat_weeks = campaign_cat_weeks[campaign_cat_weeks['categoryLevel4Id'] == cat_id]['week_start'].sort_values().values
+            cat_campaign_history[cat_id] = cat_weeks
+
+        def weeks_since_last(row):
+            cat_id = row['categoryLevel4Id']
+            week = row['week_start']
+            if pd.isna(cat_id) or cat_id not in cat_campaign_history:
+                return 104  # ~2 years default (no campaign history)
+            past = cat_campaign_history[cat_id][cat_campaign_history[cat_id] < week]
+            if len(past) == 0:
+                return 104
+            return int((week - past[-1]) / np.timedelta64(7, 'D'))
+
+        def n_campaigns_hist(row):
+            cat_id = row['categoryLevel4Id']
+            week = row['week_start']
+            if pd.isna(cat_id) or cat_id not in cat_campaign_history:
+                return 0
+            past = cat_campaign_history[cat_id][cat_campaign_history[cat_id] < week]
+            # Count distinct campaigns (group consecutive weeks)
+            if len(past) == 0:
+                return 0
+            diffs = np.diff(past).astype('timedelta64[D]').astype(int)
+            # A new campaign starts when gap > 21 days (3 weeks)
+            return 1 + int(np.sum(diffs > 21))
+
+        logging.info("  Computing category-level campaign recency and frequency...")
+        df['weeks_since_last_campaign_l4'] = df.apply(weeks_since_last, axis=1)
+        df['n_campaigns_historical_l4'] = df.apply(n_campaigns_hist, axis=1)
+    else:
+        df['weeks_since_last_campaign_l4'] = 104
+        df['n_campaigns_historical_l4'] = 0
+
+    # Drop temporary columns (keep only the feature columns)
+    cols_to_drop = (
+        available_cat_cols +
+        [f'cat_n_obs_l{lvl}' for lvl in [1, 2, 3]] +
+        ['item_baseline_log']
+    )
+    cols_to_drop = [c for c in cols_to_drop if c in df.columns]
+    df = df.drop(columns=cols_to_drop)
+
+    logging.info(f"  Category lift features added. Columns: cat_lift_l1-l4, best_cat_lift, cat_n_obs_l4, weeks_since_last_campaign_l4, n_campaigns_historical_l4")
+    return df
+
+
 def filter_to_campaign_items_only(df_item_weekly: pd.DataFrame, keep_items: list = None) -> pd.DataFrame:
     """
     Filter item weekly data to only items that were ever on campaign.
@@ -677,6 +819,25 @@ def filter_to_campaign_items_only(df_item_weekly: pd.DataFrame, keep_items: list
     logging.info(f"After removing data after last campaign week, item weekly data has {len(df_item_weekly):,} rows.")
     return df_item_weekly
 
+def mark_post_campaign_weeks(df: pd.DataFrame, id_col: str, post_campaign_weeks: int = 2) -> pd.DataFrame:
+    """
+    Mark weeks immediately following a campaign as post-campaign.
+    These have abnormal sales (recovery/pantry depletion) and should be
+    excluded from baseline normalization.
+    """
+    logging.info(f"Marking post-campaign weeks for {id_col} ({post_campaign_weeks} weeks after each campaign)...")
+    df = df.sort_values([id_col, 'week_start'])
+    df['is_post_campaign'] = 0
+
+    for n in range(1, post_campaign_weeks + 1):
+        shifted = df.groupby(id_col)['campaign_week_3'].shift(n)
+        df.loc[shifted > 0, 'is_post_campaign'] = 1
+
+    n_marked = df['is_post_campaign'].sum()
+    logging.info(f"  Marked {n_marked:,} post-campaign weeks")
+    return df
+
+
 def normalize_aggregated_sales(df: pd.DataFrame, group_by_column: str, normalizers: dict = None) -> tuple[pd.DataFrame, dict]:
     """
     Normalize aggregated sales by dividing by per-item/cluster baseline (median of non-campaign weeks).
@@ -701,8 +862,14 @@ def normalize_aggregated_sales(df: pd.DataFrame, group_by_column: str, normalize
         logging.info(f"  Using provided normalizers for {len(normalizers)} {group_by_column}s (forecasting mode)")
     else:
         # Training mode: Calculate median baseline from NON-CAMPAIGN weeks only
+        # Also exclude post-campaign recovery weeks if marked
         logging.info(f"  Calculating normalizers from data (training mode)")
-        df_baseline = df[df['campaign_week_0'] == 1].copy()
+        if 'is_post_campaign' in df.columns:
+            df_baseline = df[(df['campaign_week_0'] == 1) & (df['is_post_campaign'] == 0)].copy()
+            n_excluded = ((df['campaign_week_0'] == 1) & (df['is_post_campaign'] == 1)).sum()
+            logging.info(f"  Excluding {n_excluded:,} post-campaign weeks from normalizer")
+        else:
+            df_baseline = df[df['campaign_week_0'] == 1].copy()
         normalizers = df_baseline.groupby(group_by_column)['salesQuantityKgL'].median().to_dict()
         
         # Fallback: use mean for items with no baseline data (shouldn't happen after filtering)
@@ -813,6 +980,10 @@ def preprocess_data(df_items: pd.DataFrame, df_orders: pd.DataFrame, df_campaign
     df_item_weekly = fill_missing_weeks(df_item_weekly, id_col='baseItemId')
     df_cluster_weekly = fill_missing_weeks(df_cluster_weekly, id_col='cluster1To1Id')
 
+    # STEP 5.6: Mark post-campaign weeks (for normalizer exclusion)
+    df_item_weekly = mark_post_campaign_weeks(df_item_weekly, id_col='baseItemId', post_campaign_weeks=2)
+    df_cluster_weekly = mark_post_campaign_weeks(df_cluster_weekly, id_col='cluster1To1Id', post_campaign_weeks=2)
+
     # STEP 6: Normalize sales by per-item/cluster baseline (BEFORE filtering!)
     # Must calculate normalizers from full historical data, not filtered subset
     # Pass through normalizers if provided (forecasting mode), otherwise calculate them (training mode)
@@ -828,9 +999,12 @@ def preprocess_data(df_items: pd.DataFrame, df_orders: pd.DataFrame, df_campaign
     # This must happen AFTER normalization to ensure proper baseline calculation
     df_item_weekly = filter_to_campaign_items_only(df_item_weekly, keep_items=forecast_item_ids)
     
-    # Drop raw sales column (we only need normalized log values)
-    df_item_weekly = df_item_weekly.drop(columns=['salesQuantityKgL'])
-    df_cluster_weekly = df_cluster_weekly.drop(columns=['salesQuantityKgL'])
+    # Drop temporary columns
+    df_item_weekly = df_item_weekly.drop(columns=['salesQuantityKgL', 'is_post_campaign'], errors='ignore')
+    df_cluster_weekly = df_cluster_weekly.drop(columns=['salesQuantityKgL', 'is_post_campaign'], errors='ignore')
+
+    # STEP 7.5: Add category hierarchy features (item-level only)
+    df_item_weekly = add_category_lift_features(df_item_weekly, df_items)
 
     # STEP 8: Add time features
     df_item_weekly = add_time_features(df_item_weekly)

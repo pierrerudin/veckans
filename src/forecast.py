@@ -19,7 +19,7 @@ from config_forecast import (
     TRAIN_RATIO, VAL_RATIO, TEST_RATIO, RANDOM_STATE,
     LGBM_PARAMS, LGBM_PARAMS_CLUSTER, LGBM_QUANTILE_PARAMS, LGBM_QUANTILE_PARAMS_CLUSTER, QUANTILES,
     COMMON_FEATURES, WEEK_SPECIFIC_FEATURES, CAMPAIGN_FEATURES, CLUSTER_SPECIFIC_FEATURES,
-    TARGET_COL, METRIC_FUNCTIONS, CATEGORICAL_FEATURES
+    CATEGORY_FEATURES, TARGET_COL, METRIC_FUNCTIONS, CATEGORICAL_FEATURES
 )
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -191,8 +191,8 @@ def train_models(df_weekly, forecast_horizon_weeks, normalizers, level='cluster'
         n_target_baseline = min(n_campaign * 5, len(df_no_campaign))
         df_no_campaign_sampled = df_no_campaign.head(n_target_baseline)  # Take most recent
         
-        # Combine and shuffle
-        df_week = pd.concat([df_campaign, df_no_campaign_sampled]).sample(frac=1, random_state=42)
+        # Combine (no shuffle — we'll do a temporal split)
+        df_week = pd.concat([df_campaign, df_no_campaign_sampled])
         
         # DEBUG: Check if campaign weeks actually have higher sales
         avg_campaign = df_campaign[TARGET_COL_NORMALIZED].mean()
@@ -203,10 +203,12 @@ def train_models(df_weekly, forecast_horizon_weeks, normalizers, level='cluster'
         
         # Build feature list
         features = COMMON_FEATURES + week_specific[week_num] + CAMPAIGN_FEATURES
-        
-        # Add cluster-specific features for cluster-level models
+
+        # Add level-specific features
         if level == 'cluster':
             features = features + CLUSTER_SPECIFIC_FEATURES
+        else:
+            features = features + CATEGORY_FEATURES
         
         # Check which features are actually available
         available_features = [f for f in features if f in df_week.columns]
@@ -243,42 +245,46 @@ def train_models(df_weekly, forecast_horizon_weeks, normalizers, level='cluster'
                 n_total = len(df_week)
                 logging.info(f"    Samples: {n_total} total ({n_campaign} weighted 3x for campaign)")
         
-        # Split data (weights will be split accordingly)
-        X_temp, X_test, y_temp, y_test, w_temp, w_test = train_test_split(
-            X, y, sample_weights, test_size=TEST_RATIO, random_state=RANDOM_STATE
-        )
-        
-        val_ratio_adjusted = VAL_RATIO / (TRAIN_RATIO + VAL_RATIO)
-        X_train, X_val, y_train, y_val, w_train, w_val = train_test_split(
-            X_temp, y_temp, w_temp, test_size=val_ratio_adjusted, random_state=RANDOM_STATE
-        )
-        
-        splits = {
-            'X_train': X_train, 'y_train': y_train, 'w_train': w_train,
-            'X_val': X_val, 'y_val': y_val, 'w_val': w_val,
-            'X_test': X_test, 'y_test': y_test, 'w_test': w_test
-        }
-        logging.info(f"    Train: {len(X_train)} | Val: {len(X_val)} | Test: {len(X_test)}")
+        # Temporal split: sort by week_start, then slice by position
+        df_week_sorted = df_week.sort_values('week_start').reset_index(drop=True)
+        n = len(df_week_sorted)
+        train_end = int(n * TRAIN_RATIO)
+        val_end = int(n * (TRAIN_RATIO + VAL_RATIO))
+
+        X_sorted = df_week_sorted[available_features]
+        y_sorted = df_week_sorted[TARGET_COL_NORMALIZED]
+
+        # Recompute sample weights aligned to sorted order
+        if level == 'cluster':
+            w_sorted = 1.0 + (df_week_sorted[campaign_col].values * 0.5)
+        else:
+            w_sorted = df_week_sorted[campaign_col].map({0: 1.0, 1: 3.0}).values
+
+        X_train, y_train, w_train = X_sorted.iloc[:train_end], y_sorted.iloc[:train_end], w_sorted[:train_end]
+        X_val, y_val, w_val = X_sorted.iloc[train_end:val_end], y_sorted.iloc[train_end:val_end], w_sorted[train_end:val_end]
+        X_test, y_test, w_test = X_sorted.iloc[val_end:], y_sorted.iloc[val_end:], w_sorted[val_end:]
+
+        logging.info(f"    Train: {len(X_train)} | Val: {len(X_val)} | Test: {len(X_test)} (temporal split)")
         
         # Train models with sample weights
         logging.info("    Training point estimate...")
         point_model = train_single_model(
-            splits['X_train'], splits['y_train'], splits['w_train'],
-            splits['X_val'], splits['y_val'], splits['w_val'],
+            X_train, y_train, w_train,
+            X_val, y_val, w_val,
             level=level
         )
-        evaluate_model(point_model, splits['X_test'], splits['y_test'], "Point")
-        
+        evaluate_model(point_model, X_test, y_test, "Point")
+
         logging.info("    Training quantile models...")
         q10_model = train_single_model(
-            splits['X_train'], splits['y_train'], splits['w_train'],
-            splits['X_val'], splits['y_val'], splits['w_val'],
+            X_train, y_train, w_train,
+            X_val, y_val, w_val,
             quantile=QUANTILES[0], level=level
         )
-        
+
         q90_model = train_single_model(
-            splits['X_train'], splits['y_train'], splits['w_train'],
-            splits['X_val'], splits['y_val'], splits['w_val'],
+            X_train, y_train, w_train,
+            X_val, y_val, w_val,
             quantile=QUANTILES[2], level=level
         )
         
@@ -294,10 +300,158 @@ def train_models(df_weekly, forecast_horizon_weeks, normalizers, level='cluster'
     return models
 
 
-def predict(models, df_weekly, target_ids, forecast_date, campaign_start, level='cluster'):
+def train_models_single(df_weekly, forecast_horizon_weeks, normalizers, level='cluster', target_ids=None):
+    """
+    Train a SINGLE model for all 3 campaign weeks (alternative to 3 separate models).
+
+    Uses campaign_week_number as a numeric feature (1, 2, 3) plus interaction
+    features (campaign_week_number * lag). The model learns week-specific
+    patterns through these interactions instead of separate training runs.
+
+    Returns the same dict format as train_models() for compatibility:
+        {1: model_info, 2: model_info, 3: model_info} — all pointing to the same model.
+    """
+    logging.info(f"\nTraining SINGLE {level}-level model for all campaign weeks...")
+
+    id_col = 'baseItemId' if level == 'item' else 'cluster1To1Id'
+    TARGET_COL_NORMALIZED = TARGET_COL
+
+    # Use a unified lag feature set: the "week1" features as base
+    if level == 'cluster':
+        base_lag_features = ['cluster_sales_lag_week1', 'cluster_sales_rolling_4w_week1']
+    else:
+        base_lag_features = ['sales_lag_week1', 'sales_rolling_4w_week1',
+                             'cluster_sales_lag_week1', 'cluster_sales_rolling_4w_week1']
+
+    features = COMMON_FEATURES + base_lag_features + CAMPAIGN_FEATURES + ['campaign_week_number']
+    if level == 'cluster':
+        features = features + CLUSTER_SPECIFIC_FEATURES
+    else:
+        features = features + CATEGORY_FEATURES
+
+    # Collect training data across all 3 campaign weeks
+    all_dfs = []
+    for week_num in [1, 2, 3]:
+        campaign_col = f'campaign_week_{week_num}'
+
+        if level == 'cluster':
+            ids_with_campaigns = df_weekly[df_weekly[campaign_col] > 0][id_col].unique()
+        else:
+            ids_with_campaigns = df_weekly[df_weekly[campaign_col] == 1][id_col].unique()
+
+        training_ids = set(ids_with_campaigns)
+        if target_ids:
+            training_ids.update(target_ids)
+        training_ids = list(training_ids)
+
+        df_week = df_weekly[df_weekly[id_col].isin(training_ids)].copy()
+
+        # Balance: keep all campaign weeks, sample baseline
+        if level == 'cluster':
+            df_campaign = df_week[df_week[campaign_col] > 0].copy()
+            df_baseline = df_week[(df_week[campaign_col] == 0) & (df_week['campaign_week_0'] > 0)].copy()
+        else:
+            df_campaign = df_week[df_week[campaign_col] == 1].copy()
+            df_baseline = df_week[(df_week[campaign_col] == 0) & (df_week['campaign_week_0'] == 1)].copy()
+
+        n_campaign = len(df_campaign)
+        n_target_baseline = min(n_campaign * 5, len(df_baseline))
+        df_baseline_sampled = df_baseline.sort_values('week_start', ascending=False).head(n_target_baseline)
+
+        combined = pd.concat([df_campaign, df_baseline_sampled])
+
+        # Add campaign_week_number feature (0 for baseline, 1/2/3 for campaign)
+        combined['campaign_week_number'] = 0
+        if level == 'cluster':
+            combined.loc[combined[campaign_col] > 0, 'campaign_week_number'] = week_num
+        else:
+            combined.loc[combined[campaign_col] == 1, 'campaign_week_number'] = week_num
+
+        # Map week-specific lag features to unified names
+        lag_mapping = {
+            f'sales_lag_week{week_num}': 'sales_lag_week1',
+            f'sales_rolling_4w_week{week_num}': 'sales_rolling_4w_week1',
+            f'cluster_sales_lag_week{week_num}': 'cluster_sales_lag_week1',
+            f'cluster_sales_rolling_4w_week{week_num}': 'cluster_sales_rolling_4w_week1',
+        }
+        for src, dst in lag_mapping.items():
+            if src in combined.columns and src != dst:
+                combined[dst] = combined[src]
+
+        all_dfs.append(combined)
+
+    df_all = pd.concat(all_dfs, ignore_index=True)
+
+    # Add interaction features (use correct lag column name per level)
+    lag_col = 'sales_lag_week1' if level == 'item' else 'cluster_sales_lag_week1'
+    roll_col = 'sales_rolling_4w_week1' if level == 'item' else 'cluster_sales_rolling_4w_week1'
+    df_all['cwn_x_lag'] = df_all['campaign_week_number'] * df_all[lag_col]
+    df_all['cwn_x_rolling'] = df_all['campaign_week_number'] * df_all[roll_col]
+    interaction_features = ['cwn_x_lag', 'cwn_x_rolling']
+    features = features + interaction_features
+
+    available_features = [f for f in features if f in df_all.columns]
+
+    logging.info(f"  Combined training data: {len(df_all)} samples")
+    logging.info(f"  Features ({len(available_features)}): {available_features}")
+
+    # Temporal split
+    df_all = df_all.sort_values('week_start').reset_index(drop=True)
+    n = len(df_all)
+    train_end = int(n * TRAIN_RATIO)
+    val_end = int(n * (TRAIN_RATIO + VAL_RATIO))
+
+    X_sorted = df_all[available_features]
+    y_sorted = df_all[TARGET_COL_NORMALIZED]
+
+    # Sample weights
+    if level == 'cluster':
+        w_sorted = np.ones(n)
+        for wk in [1, 2, 3]:
+            col = f'campaign_week_{wk}'
+            if col in df_all.columns:
+                w_sorted += df_all[col].values * 0.5
+    else:
+        w_sorted = np.ones(n)
+        for wk in [1, 2, 3]:
+            col = f'campaign_week_{wk}'
+            if col in df_all.columns:
+                w_sorted[df_all[col] == 1] = 3.0
+
+    X_train, y_train, w_train = X_sorted.iloc[:train_end], y_sorted.iloc[:train_end], w_sorted[:train_end]
+    X_val, y_val, w_val = X_sorted.iloc[train_end:val_end], y_sorted.iloc[train_end:val_end], w_sorted[train_end:val_end]
+    X_test, y_test, w_test = X_sorted.iloc[val_end:], y_sorted.iloc[val_end:], w_sorted[val_end:]
+
+    logging.info(f"  Train: {len(X_train)} | Val: {len(X_val)} | Test: {len(X_test)}")
+
+    # Train single point model
+    logging.info("  Training point estimate...")
+    point_model = train_single_model(X_train, y_train, w_train, X_val, y_val, w_val, level=level)
+    evaluate_model(point_model, X_test, y_test, "Single-Point")
+
+    logging.info("  Training quantile models...")
+    q10_model = train_single_model(X_train, y_train, w_train, X_val, y_val, w_val, quantile=QUANTILES[0], level=level)
+    q90_model = train_single_model(X_train, y_train, w_train, X_val, y_val, w_val, quantile=QUANTILES[2], level=level)
+
+    # Return same format as train_models() — all weeks share the same model
+    model_info = {
+        'point': point_model,
+        'q10': q10_model,
+        'q90': q90_model,
+        'features': available_features,
+        'normalizers': normalizers,
+        'single_model': True,  # Flag for predict() to know about interaction features
+    }
+    models = {1: model_info, 2: model_info, 3: model_info}
+
+    logging.info(f"\n✅ Single {level}-level model trained (shared across weeks 1-3)")
+    return models
+
+
+def predict(models, df_weekly, target_ids, forecast_date, campaign_start, level='cluster', campaign_on=True):
     """
     Generate forecasts using trained models.
-    
+
     Parameters:
         models: Trained models from train_models()
         df_weekly: Preprocessed weekly data
@@ -305,12 +459,14 @@ def predict(models, df_weekly, target_ids, forecast_date, campaign_start, level=
         forecast_date: Date when forecast is made
         campaign_start: Campaign start date
         level: 'item' or 'cluster'
-    
+        campaign_on: If True, predict with campaign flags active. If False, predict baseline (no campaign).
+
     Returns:
         DataFrame with predictions
     """
     id_col = 'baseItemId' if level == 'item' else 'cluster1To1Id'
-    logging.info(f"\nGenerating {level}-level forecasts for {len(target_ids)} targets...")
+    mode = "campaign" if campaign_on else "baseline"
+    logging.info(f"\nGenerating {level}-level {mode} forecasts for {len(target_ids)} targets...")
     
     # Filter to target IDs and data up to forecast date
     df_forecast = df_weekly[
@@ -340,19 +496,57 @@ def predict(models, df_weekly, target_ids, forecast_date, campaign_start, level=
             model_info = models[week_num]
             features = model_info['features']
             
-            # IMPORTANT: Set campaign flags for prediction
-            # We're predicting WITH a campaign, so set the corresponding week flag to 1
-            df_latest['campaign_week_0'] = 0  # Not baseline
-            df_latest['campaign_week_1'] = 1 if week_num == 1 else 0
-            df_latest['campaign_week_2'] = 1 if week_num == 2 else 0
-            df_latest['campaign_week_3'] = 1 if week_num == 3 else 0
+            # Set campaign flags for prediction
+            if not campaign_on:
+                # Counterfactual: predict without campaign
+                if level == 'cluster':
+                    df_latest['campaign_week_0'] = 1.0
+                else:
+                    df_latest['campaign_week_0'] = 1
+                df_latest['campaign_week_1'] = 0
+                df_latest['campaign_week_2'] = 0
+                df_latest['campaign_week_3'] = 0
+            elif level == 'cluster':
+                # Cluster with campaign: intensity = 1/num_items
+                num_items = df_latest['num_items_in_cluster'].values[0]
+                intensity = 1.0 / max(num_items, 1)
+                df_latest['campaign_week_0'] = 1 - intensity
+                df_latest['campaign_week_1'] = intensity if week_num == 1 else 0
+                df_latest['campaign_week_2'] = intensity if week_num == 2 else 0
+                df_latest['campaign_week_3'] = intensity if week_num == 3 else 0
+            else:
+                # Item with campaign: binary flags
+                df_latest['campaign_week_0'] = 0
+                df_latest['campaign_week_1'] = 1 if week_num == 1 else 0
+                df_latest['campaign_week_2'] = 1 if week_num == 2 else 0
+                df_latest['campaign_week_3'] = 1 if week_num == 3 else 0
             
+            # Single-model mode: add campaign_week_number and interaction features
+            if model_info.get('single_model'):
+                df_latest['campaign_week_number'] = week_num if campaign_on else 0
+                # Map week-specific lags to unified names
+                for src, dst in [
+                    (f'sales_lag_week{week_num}', 'sales_lag_week1'),
+                    (f'sales_rolling_4w_week{week_num}', 'sales_rolling_4w_week1'),
+                    (f'cluster_sales_lag_week{week_num}', 'cluster_sales_lag_week1'),
+                    (f'cluster_sales_rolling_4w_week{week_num}', 'cluster_sales_rolling_4w_week1'),
+                ]:
+                    if src in df_latest.columns and src != dst:
+                        df_latest[dst] = df_latest[src]
+                # Interaction features (use correct lag column per level)
+                lag_col = 'sales_lag_week1' if level == 'item' else 'cluster_sales_lag_week1'
+                roll_col = 'sales_rolling_4w_week1' if level == 'item' else 'cluster_sales_rolling_4w_week1'
+                lag_val = df_latest[lag_col].values[0] if lag_col in df_latest.columns else 0
+                roll_val = df_latest[roll_col].values[0] if roll_col in df_latest.columns else 0
+                df_latest['cwn_x_lag'] = df_latest['campaign_week_number'] * lag_val
+                df_latest['cwn_x_rolling'] = df_latest['campaign_week_number'] * roll_val
+
             # Check if we have all required features
             missing = set(features) - set(df_latest.columns)
             if missing:
                 logging.warning(f"  {target_id} week {week_num}: missing {missing}")
                 continue
-            
+
             X_pred = df_latest[features]
             
             # Generate predictions (these are in normalized log scale)
@@ -387,7 +581,7 @@ def predict(models, df_weekly, target_ids, forecast_date, campaign_start, level=
             })
     
     df_predictions = pd.DataFrame(predictions)
-    logging.info(f"✅ Generated {len(df_predictions)} {level}-level forecasts")
+    logging.info(f"Generated {len(df_predictions)} {level}-level {mode} forecasts")
     
     return df_predictions
 

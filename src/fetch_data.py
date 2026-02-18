@@ -94,9 +94,13 @@ def _fetch_items_by_ids(datalake_connector, item_ids: list, columns: list = None
         DataFrame with requested items
     """
     if columns is None:
-        columns = ['itemId', 'itemDesc', 'itemSkey', 'cluster1To1Id', 'weightKgPreparedItemComparisonUnit', 
-                   'netWeightKgComparisonUnit', 'grossWeightKgComparisonUnit', 'itemRegDate']
-    
+        columns = ['itemId', 'itemDesc', 'itemSkey', 'cluster1To1Id', 'weightKgPreparedItemComparisonUnit',
+                   'netWeightKgComparisonUnit', 'grossWeightKgComparisonUnit', 'itemRegDate',
+                   'categoryLevel1Id', 'categoryLevel1Desc',
+                   'categoryLevel2Id', 'categoryLevel2Desc',
+                   'categoryLevel3Id', 'categoryLevel3Desc',
+                   'categoryLevel4Id', 'categoryLevel4Desc']
+
     logging.info(f"Fetching {len(item_ids)} specific items from Azure Data Lake...")
     
     query = {
@@ -126,9 +130,13 @@ def _fetch_items_by_clusters(datalake_connector, cluster_ids: list, columns: lis
         DataFrame with all items in the specified clusters
     """
     if columns is None:
-        columns = ['itemId', 'itemDesc', 'itemSkey', 'cluster1To1Id', 'weightKgPreparedItemComparisonUnit', 
-                   'netWeightKgComparisonUnit', 'grossWeightKgComparisonUnit', 'itemRegDate']
-    
+        columns = ['itemId', 'itemDesc', 'itemSkey', 'cluster1To1Id', 'weightKgPreparedItemComparisonUnit',
+                   'netWeightKgComparisonUnit', 'grossWeightKgComparisonUnit', 'itemRegDate',
+                   'categoryLevel1Id', 'categoryLevel1Desc',
+                   'categoryLevel2Id', 'categoryLevel2Desc',
+                   'categoryLevel3Id', 'categoryLevel3Desc',
+                   'categoryLevel4Id', 'categoryLevel4Desc']
+
     logging.info(f"Fetching all items from {len(cluster_ids)} clusters from Azure Data Lake...")
     
     query = {

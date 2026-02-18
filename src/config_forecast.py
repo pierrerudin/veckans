@@ -73,7 +73,7 @@ COMMON_FEATURES = [
     'week_of_year_sin',
     'week_of_year_cos',
     'sales_lag_12w',  # 3-month lag for recent trends
-    #'sales_lag_52w',  # Year-over-year comparison (safe now with normalization)
+    'sales_lag_52w',  # Year-over-year comparison
 ]
 
 # Categorical features (LightGBM will handle these specially)
@@ -92,6 +92,18 @@ CAMPAIGN_FEATURES = [
     'campaign_week_1',
     'campaign_week_2',
     'campaign_week_3',
+]
+
+# Category hierarchy features (item-level only — cold-start priors)
+CATEGORY_FEATURES = [
+    'cat_lift_l1',               # Broadest category lift prior
+    'cat_lift_l2',
+    'cat_lift_l3',
+    'cat_lift_l4',               # Most specific category lift prior
+    'best_cat_lift',             # Shrinkage-weighted blend across levels
+    'cat_n_obs_l4',              # Number of historical campaign observations at L4
+    'weeks_since_last_campaign_l4',  # Recency of campaigns in this category
+    'n_campaigns_historical_l4',     # Frequency of campaigns in this category
 ]
 
 # Cluster-specific features (only for cluster-level models)
@@ -146,7 +158,7 @@ METRIC_FUNCTIONS = {
 # ============================================================================
 DEFAULT_FORECAST_HORIZON_WEEKS = 8
 MAX_FORECAST_HORIZON_WEEKS = 12
-MIN_FORECAST_HORIZON_WEEKS = 4
+MIN_FORECAST_HORIZON_WEEKS = 0
 
 # Model storage
 MODEL_DIR = '../data/models/'
