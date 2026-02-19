@@ -29,7 +29,7 @@ from config_forecast import (
     TRAIN_RATIO, VAL_RATIO, TEST_RATIO,
     COMMON_FEATURES, CAMPAIGN_FEATURES,
     CLUSTER_SPECIFIC_FEATURES, CATEGORY_FEATURES,
-    TARGET_COL, METRIC_FUNCTIONS,
+    CAMPAIGN_COMPETITION_FEATURES, TARGET_COL, METRIC_FUNCTIONS,
 )
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -54,7 +54,7 @@ def build_feature_list(week_num: int, level: str, df_columns: list) -> list:
     if level == 'cluster':
         features = features + CLUSTER_SPECIFIC_FEATURES
     else:
-        features = features + CATEGORY_FEATURES
+        features = features + CATEGORY_FEATURES + CAMPAIGN_COMPETITION_FEATURES
 
     return [f for f in features if f in df_columns]
 

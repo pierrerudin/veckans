@@ -19,7 +19,7 @@ from config_forecast import (
     TRAIN_RATIO, VAL_RATIO, TEST_RATIO, RANDOM_STATE,
     LGBM_PARAMS, LGBM_PARAMS_CLUSTER, LGBM_QUANTILE_PARAMS, LGBM_QUANTILE_PARAMS_CLUSTER, QUANTILES,
     COMMON_FEATURES, WEEK_SPECIFIC_FEATURES, CAMPAIGN_FEATURES, CLUSTER_SPECIFIC_FEATURES,
-    CATEGORY_FEATURES, TARGET_COL, METRIC_FUNCTIONS, CATEGORICAL_FEATURES
+    CATEGORY_FEATURES, CAMPAIGN_COMPETITION_FEATURES, TARGET_COL, METRIC_FUNCTIONS, CATEGORICAL_FEATURES
 )
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -208,12 +208,12 @@ def train_models(df_weekly, forecast_horizon_weeks, normalizers, level='cluster'
         if level == 'cluster':
             features = features + CLUSTER_SPECIFIC_FEATURES
         else:
-            features = features + CATEGORY_FEATURES
-        
+            features = features + CATEGORY_FEATURES + CAMPAIGN_COMPETITION_FEATURES
+
         # Check which features are actually available
         available_features = [f for f in features if f in df_week.columns]
         missing_features = set(features) - set(available_features)
-        
+
         if missing_features:
             logging.warning(f"    Missing features: {missing_features}")
         
@@ -327,7 +327,7 @@ def train_models_single(df_weekly, forecast_horizon_weeks, normalizers, level='c
     if level == 'cluster':
         features = features + CLUSTER_SPECIFIC_FEATURES
     else:
-        features = features + CATEGORY_FEATURES
+        features = features + CATEGORY_FEATURES + CAMPAIGN_COMPETITION_FEATURES
 
     # Collect training data across all 3 campaign weeks
     all_dfs = []
@@ -448,7 +448,7 @@ def train_models_single(df_weekly, forecast_horizon_weeks, normalizers, level='c
     return models
 
 
-def predict(models, df_weekly, target_ids, forecast_date, campaign_start, level='cluster', campaign_on=True):
+def predict(models, df_weekly, target_ids, forecast_date, campaign_start, level='cluster', campaign_on=True, campaign_items_per_cluster=None, cluster_sizes=None):
     """
     Generate forecasts using trained models.
 
@@ -460,6 +460,12 @@ def predict(models, df_weekly, target_ids, forecast_date, campaign_start, level=
         campaign_start: Campaign start date
         level: 'item' or 'cluster'
         campaign_on: If True, predict with campaign flags active. If False, predict baseline (no campaign).
+        campaign_items_per_cluster: Dict mapping cluster1To1Id -> number of items on campaign in that cluster.
+                                   Used for both cluster intensity and item-level competition features.
+                                   If None, defaults to 1 item per cluster.
+        cluster_sizes: Dict mapping cluster1To1Id -> total number of items in cluster.
+                      Used to compute campaign_coverage at prediction time.
+                      If None, falls back to num_items_in_cluster from the data.
 
     Returns:
         DataFrame with predictions
@@ -503,13 +509,21 @@ def predict(models, df_weekly, target_ids, forecast_date, campaign_start, level=
                     df_latest['campaign_week_0'] = 1.0
                 else:
                     df_latest['campaign_week_0'] = 1
+                    # No campaign → no competition
+                    df_latest['n_campaign_items_in_cluster'] = 0
+                    df_latest['campaign_coverage'] = 0.0
+                    df_latest['coverage_x_share'] = 0.0
                 df_latest['campaign_week_1'] = 0
                 df_latest['campaign_week_2'] = 0
                 df_latest['campaign_week_3'] = 0
             elif level == 'cluster':
-                # Cluster with campaign: intensity = 1/num_items
+                # Cluster with campaign: intensity = n_campaign_items / num_items_in_cluster
                 num_items = df_latest['num_items_in_cluster'].values[0]
-                intensity = 1.0 / max(num_items, 1)
+                n_on_campaign = campaign_items_per_cluster.get(target_id, 1) if campaign_items_per_cluster else 1
+                intensity = float(n_on_campaign) / max(num_items, 1)
+                intensity = min(intensity, 1.0)  # Cap at 1.0
+                if n_on_campaign > 1:
+                    logging.info(f"  Cluster {target_id}: {n_on_campaign}/{num_items} items on campaign, intensity={intensity:.3f}")
                 df_latest['campaign_week_0'] = 1 - intensity
                 df_latest['campaign_week_1'] = intensity if week_num == 1 else 0
                 df_latest['campaign_week_2'] = intensity if week_num == 2 else 0
@@ -520,6 +534,20 @@ def predict(models, df_weekly, target_ids, forecast_date, campaign_start, level=
                 df_latest['campaign_week_1'] = 1 if week_num == 1 else 0
                 df_latest['campaign_week_2'] = 1 if week_num == 2 else 0
                 df_latest['campaign_week_3'] = 1 if week_num == 3 else 0
+                # Set campaign competition features from the forecast plan
+                cluster_id = df_latest['cluster1To1Id'].values[0] if 'cluster1To1Id' in df_latest.columns else None
+                item_share = df_latest['item_share_in_cluster'].values[0] if 'item_share_in_cluster' in df_latest.columns else 1.0
+                if campaign_items_per_cluster and cluster_id:
+                    n_on_campaign = campaign_items_per_cluster.get(cluster_id, 1)
+                    total = cluster_sizes.get(cluster_id, 1) if cluster_sizes else 1
+                    coverage = float(n_on_campaign) / max(total, 1)
+                else:
+                    # No info provided — assume solo campaign in cluster
+                    n_on_campaign = 1
+                    coverage = 0.0  # No campaign plan info → treat as non-campaign for coverage
+                df_latest['n_campaign_items_in_cluster'] = n_on_campaign
+                df_latest['campaign_coverage'] = coverage
+                df_latest['coverage_x_share'] = coverage * item_share
             
             # Single-model mode: add campaign_week_number and interaction features
             if model_info.get('single_model'):

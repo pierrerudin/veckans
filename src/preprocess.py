@@ -313,12 +313,93 @@ def aggregate_to_weekly(df_orders: pd.DataFrame, df_items: pd.DataFrame,
         cluster_agg.append(row)
     
     df_cluster_weekly = pd.DataFrame(cluster_agg)
-    
-    # Apply log transformation to weekly aggregated values
-    
+
+    # --- Item-level campaign competition features ---
+    # For each item-week on campaign, count how many items in the same cluster
+    # are also on campaign. This lets the model learn that shared campaigns
+    # dilute per-item lift (e.g., 3/6 cutting boards on sale → less lift each).
+    # The pattern transfers across clusters: pork chops teach cutting boards.
+
+    # Count items on campaign per cluster-week (any of weeks 1-3)
+    is_on_campaign = (
+        (df_item_weekly['campaign_week_1'] == 1) |
+        (df_item_weekly['campaign_week_2'] == 1) |
+        (df_item_weekly['campaign_week_3'] == 1)
+    )
+    campaign_counts = (
+        df_item_weekly[is_on_campaign]
+        .groupby(['cluster1To1Id', 'week_start'])['baseItemId']
+        .nunique()
+        .reset_index()
+        .rename(columns={'baseItemId': 'n_campaign_items_in_cluster'})
+    )
+
+    # Stable cluster size: total unique items per cluster across all weeks.
+    # This matches the denominator used at prediction time (from df_items).
+    cluster_total_sizes = (
+        df_item_weekly
+        .groupby('cluster1To1Id')['baseItemId']
+        .nunique()
+        .reset_index()
+        .rename(columns={'baseItemId': '_cluster_total_size'})
+    )
+
+    # Merge onto item-level data
+    df_item_weekly = df_item_weekly.merge(
+        campaign_counts, on=['cluster1To1Id', 'week_start'], how='left'
+    )
+    df_item_weekly['n_campaign_items_in_cluster'] = (
+        df_item_weekly['n_campaign_items_in_cluster'].fillna(0).astype(int)
+    )
+
+    df_item_weekly = df_item_weekly.merge(
+        cluster_total_sizes, on='cluster1To1Id', how='left'
+    )
+    df_item_weekly['campaign_coverage'] = (
+        df_item_weekly['n_campaign_items_in_cluster'] /
+        df_item_weekly['_cluster_total_size'].clip(lower=1)
+    )
+    df_item_weekly.drop(columns=['_cluster_total_size'], inplace=True)
+
+    # Item share within cluster: this item's baseline sales as fraction of cluster total.
+    # Computed from non-campaign weeks to avoid leakage.
+    baseline_mask = df_item_weekly['campaign_week_0'] == 1
+    baseline_item_sales = (
+        df_item_weekly[baseline_mask]
+        .groupby(['cluster1To1Id', 'baseItemId'])['salesQuantityKgL']
+        .mean()
+        .reset_index()
+        .rename(columns={'salesQuantityKgL': '_item_avg'})
+    )
+    baseline_cluster_totals = (
+        baseline_item_sales
+        .groupby('cluster1To1Id')['_item_avg']
+        .sum()
+        .reset_index()
+        .rename(columns={'_item_avg': '_cluster_avg'})
+    )
+    baseline_item_sales = baseline_item_sales.merge(baseline_cluster_totals, on='cluster1To1Id')
+    baseline_item_sales['item_share_in_cluster'] = (
+        baseline_item_sales['_item_avg'] / baseline_item_sales['_cluster_avg'].clip(lower=1e-6)
+    )
+
+    df_item_weekly = df_item_weekly.merge(
+        baseline_item_sales[['cluster1To1Id', 'baseItemId', 'item_share_in_cluster']],
+        on=['cluster1To1Id', 'baseItemId'], how='left'
+    )
+    df_item_weekly['item_share_in_cluster'] = df_item_weekly['item_share_in_cluster'].fillna(1.0)
+
+    # Interaction: campaign_coverage × item_share
+    df_item_weekly['coverage_x_share'] = (
+        df_item_weekly['campaign_coverage'] * df_item_weekly['item_share_in_cluster']
+    )
+
+    n_multi = (df_item_weekly['n_campaign_items_in_cluster'] > 1).sum()
+    logging.info(f"  Campaign competition: {n_multi:,} item-weeks with multi-item campaigns")
+
     logging.info(f"  Item weekly: {len(df_item_weekly):,} rows ({df_item_weekly['baseItemId'].nunique()} items)")
     logging.info(f"  Cluster weekly: {len(df_cluster_weekly):,} rows ({df_cluster_weekly['cluster1To1Id'].nunique()} clusters)")
-    
+
     return df_item_weekly, df_cluster_weekly
 
 

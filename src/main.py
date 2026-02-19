@@ -188,36 +188,50 @@ def format_results(df_item_predictions, df_item_baseline, df_cluster_predictions
         cluster_preds = df_cluster_predictions[df_cluster_predictions['cluster1To1Id'] == cluster_id] if len(df_cluster_predictions) > 0 else pd.DataFrame()
         cluster_bases = df_cluster_baseline[df_cluster_baseline['cluster1To1Id'] == cluster_id] if len(df_cluster_baseline) > 0 else pd.DataFrame()
 
-        row = {'item_id': item_id, 'description': item_desc, 'cluster_id': cluster_id}
+        # Get cluster size
+        cluster_rows = df_cluster_weekly[df_cluster_weekly['cluster1To1Id'] == cluster_id]
+        num_items = int(cluster_rows['num_items_in_cluster'].iloc[0]) if len(cluster_rows) > 0 and 'num_items_in_cluster' in cluster_rows.columns else 1
 
-        # Per-week item forecasts
+        row = {'item_id': item_id, 'description': item_desc, 'cluster_id': cluster_id, 'cluster_size': num_items}
+
+        # Per-week item forecasts (convert from kg/L back to sales units)
         for wk in [1, 2, 3]:
             wk_pred = item_preds[item_preds['campaign_week'] == wk]
             wk_base = item_bases[item_bases['campaign_week'] == wk]
-            row[f'item_w{wk}_campaign'] = wk_pred['prediction_kgl'].values[0] if len(wk_pred) > 0 else 0
-            row[f'item_w{wk}_baseline'] = wk_base['prediction_kgl'].values[0] if len(wk_base) > 0 else 0
+            pred_kgl = wk_pred['prediction_kgl'].values[0] if len(wk_pred) > 0 else 0
+            base_kgl = wk_base['prediction_kgl'].values[0] if len(wk_base) > 0 else 0
+            row[f'item_w{wk}_campaign'] = pred_kgl / unit_conv if unit_conv > 0 else 0
+            row[f'item_w{wk}_baseline'] = base_kgl / unit_conv if unit_conv > 0 else 0
 
-        # Item totals
+        # Item totals (already in sales units)
         row['item_campaign_total'] = sum(row[f'item_w{wk}_campaign'] for wk in [1, 2, 3])
         row['item_baseline_total'] = sum(row[f'item_w{wk}_baseline'] for wk in [1, 2, 3])
-        row['item_effect_kg'] = row['item_campaign_total'] - row['item_baseline_total']
-        row['item_effect_pct'] = (row['item_effect_kg'] / row['item_baseline_total'] * 100) if row['item_baseline_total'] > 0 else 0
+        row['item_effect'] = row['item_campaign_total'] - row['item_baseline_total']
+        row['item_effect_pct'] = (row['item_effect'] / row['item_baseline_total'] * 100) if row['item_baseline_total'] > 0 else 0
 
-        # Item units (using unit conversion)
-        row['item_campaign_units'] = row['item_campaign_total'] / unit_conv if unit_conv > 0 else 0
-        row['item_baseline_units'] = row['item_baseline_total'] / unit_conv if unit_conv > 0 else 0
-
-        # Cluster totals
+        # Cluster totals (kg/L — clusters mix different items so can't convert to one unit)
         row['cluster_campaign_total'] = cluster_preds['prediction_kgl'].sum() if len(cluster_preds) > 0 else 0
         row['cluster_baseline_total'] = cluster_bases['prediction_kgl'].sum() if len(cluster_bases) > 0 else 0
         row['cluster_effect_kg'] = row['cluster_campaign_total'] - row['cluster_baseline_total']
         row['cluster_effect_pct'] = (row['cluster_effect_kg'] / row['cluster_baseline_total'] * 100) if row['cluster_baseline_total'] > 0 else 0
 
         # Cannibalization verdict
-        item_eff = row['item_effect_kg']
+        # For singleton clusters the item IS the cluster, so comparing item vs cluster
+        # effect is meaningless (two different models predicting the same entity).
+        item_eff = row['item_effect']
         cluster_eff = row['cluster_effect_kg']
-        if item_eff > 0 and cluster_eff > 0:
-            row['verdict'] = 'Halo' if item_eff > cluster_eff * 0.8 else 'Positive'
+        if num_items <= 1:
+            if item_eff > 0:
+                row['verdict'] = 'Positive (sole)'
+            elif item_eff < 0:
+                row['verdict'] = 'Negative (sole)'
+            else:
+                row['verdict'] = 'Neutral (sole)'
+        elif item_eff > 0 and cluster_eff > 0:
+            if item_eff > cluster_eff * 0.8:
+                row['verdict'] = 'Halo'
+            else:
+                row['verdict'] = 'Positive'
         elif item_eff > 0 and cluster_eff < 0:
             row['verdict'] = 'Cannibalization'
         elif item_eff < 0:
@@ -230,17 +244,17 @@ def format_results(df_item_predictions, df_item_baseline, df_cluster_predictions
     df_summary = pd.DataFrame(rows)
 
     # Print formatted table
-    print("\n" + "=" * 160)
+    print("\n" + "=" * 168)
     print(f"CAMPAIGN FORECAST SUMMARY  (forecast date: {forecast_date.strftime('%Y-%m-%d')})")
-    print("=" * 160)
+    print("=" * 168)
 
-    # Item detail table: per-week breakdown
+    # Item detail table: per-week breakdown (in sales units)
     print(f"\n{'Item ID':<10} {'Description':<30} "
           f"{'W1 Camp':>9} {'W1 Base':>9} "
           f"{'W2 Camp':>9} {'W2 Base':>9} "
           f"{'W3 Camp':>9} {'W3 Base':>9} "
           f"{'Total C':>10} {'Total B':>10} {'Effect%':>8}")
-    print("-" * 160)
+    print("-" * 168)
 
     for _, r in df_summary.iterrows():
         print(f"{r['item_id']:<10} {str(r['description'])[:29]:<30} "
@@ -250,31 +264,33 @@ def format_results(df_item_predictions, df_item_baseline, df_cluster_predictions
               f"{r['item_campaign_total']:>10,.0f} {r['item_baseline_total']:>10,.0f} "
               f"{r['item_effect_pct']:>7.1f}%")
 
-    # Summary table: item + cluster effects + verdict
+    # Summary table: item in sales units, cluster in kg/L (mixed items can't share a unit)
     print(f"\n{'Item ID':<10} {'Description':<30} "
-          f"{'Item Camp':>12} {'Item Base':>12} {'Item Eff':>10} {'Item%':>7} "
-          f"{'Clust Camp':>12} {'Clust Base':>12} {'Clust%':>8} "
+          f"{'Camp(units)':>12} {'Base(units)':>12} {'Effect':>10} {'Item%':>7} "
+          f"{'#Clust':>6} {'Camp(kgL)':>12} {'Base(kgL)':>12} {'Clust%':>8} "
           f"{'Verdict':<18}")
-    print("-" * 160)
+    print("-" * 168)
 
     for _, r in df_summary.iterrows():
         print(f"{r['item_id']:<10} {str(r['description'])[:29]:<30} "
               f"{r['item_campaign_total']:>12,.0f} {r['item_baseline_total']:>12,.0f} "
-              f"{r['item_effect_kg']:>10,.0f} {r['item_effect_pct']:>6.1f}% "
+              f"{r['item_effect']:>10,.0f} {r['item_effect_pct']:>6.1f}% "
+              f"{r['cluster_size']:>6} "
               f"{r['cluster_campaign_total']:>12,.0f} {r['cluster_baseline_total']:>12,.0f} "
               f"{r['cluster_effect_pct']:>7.1f}% "
               f"{r['verdict']:<18}")
 
-    # Grand totals
-    print("-" * 160)
+    # Grand totals (item-level only — can't sum units across different items meaningfully)
+    print("-" * 168)
     t_ic = df_summary['item_campaign_total'].sum()
     t_ib = df_summary['item_baseline_total'].sum()
     t_ie = t_ic - t_ib
     t_ip = (t_ie / t_ib * 100) if t_ib > 0 else 0
-    print(f"{'TOTAL':<10} {'':<30} "
+    print(f"{'TOTAL':<10} {'(mixed units — indicative only)':<30} "
           f"{t_ic:>12,.0f} {t_ib:>12,.0f} "
-          f"{t_ie:>10,.0f} {t_ip:>6.1f}%")
-    print("=" * 160)
+          f"{t_ie:>10,.0f} {t_ip:>6.1f}% "
+          f"{'':>6}")
+    print("=" * 168)
 
     return df_summary
 
@@ -306,6 +322,26 @@ def main():
         # Get target IDs
         target_items = item_ids
         target_clusters = df_items[df_items['baseItemId'].isin(item_ids)]['cluster1To1Id'].unique().tolist()
+
+        # Build mapping: how many of the forecasted items are in each cluster
+        # This is needed for correct cluster campaign intensity and item-level competition features
+        campaign_items_per_cluster = (
+            df_items[df_items['baseItemId'].isin(item_ids)]
+            .groupby('cluster1To1Id')['baseItemId']
+            .nunique()
+            .to_dict()
+        )
+        # Total cluster sizes (all items, not just those on campaign)
+        cluster_sizes = (
+            df_items
+            .groupby('cluster1To1Id')['baseItemId']
+            .nunique()
+            .to_dict()
+        )
+        for cid, n in campaign_items_per_cluster.items():
+            if n > 1:
+                total = cluster_sizes.get(cid, n)
+                logging.info(f"  Cluster {cid}: {n}/{total} items on campaign")
         
         # Step 3: Train item models
         logging.info("\n" + "="*80)
@@ -330,14 +366,14 @@ def main():
         logging.info("\n" + "="*80)
         logging.info("STEP 5: Forecasting items")
         logging.info("="*80)
-        df_item_predictions = predict(item_models, df_item_weekly, target_items, forecast_date, campaign_start, level='item', campaign_on=True)
+        df_item_predictions = predict(item_models, df_item_weekly, target_items, forecast_date, campaign_start, level='item', campaign_on=True, campaign_items_per_cluster=campaign_items_per_cluster, cluster_sizes=cluster_sizes)
         df_item_baseline = predict(item_models, df_item_weekly, target_items, forecast_date, campaign_start, level='item', campaign_on=False)
 
         # Step 6: Forecast clusters
         logging.info("\n" + "="*80)
         logging.info("STEP 6: Forecasting clusters")
         logging.info("="*80)
-        df_cluster_predictions = predict(cluster_models, df_cluster_weekly, target_clusters, forecast_date, campaign_start, level='cluster', campaign_on=True)
+        df_cluster_predictions = predict(cluster_models, df_cluster_weekly, target_clusters, forecast_date, campaign_start, level='cluster', campaign_on=True, campaign_items_per_cluster=campaign_items_per_cluster)
         df_cluster_baseline = predict(cluster_models, df_cluster_weekly, target_clusters, forecast_date, campaign_start, level='cluster', campaign_on=False)
         
         # Step 7: Format and display results

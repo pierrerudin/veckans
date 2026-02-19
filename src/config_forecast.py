@@ -106,6 +106,14 @@ CATEGORY_FEATURES = [
     'n_campaigns_historical_l4',     # Frequency of campaigns in this category
 ]
 
+# Campaign competition features (item-level only — within-cluster dynamics)
+CAMPAIGN_COMPETITION_FEATURES = [
+    'campaign_coverage',             # Fraction of cluster items on campaign (0-1)
+    'n_campaign_items_in_cluster',   # Raw count of items on campaign in same cluster
+    'item_share_in_cluster',         # This item's share of cluster baseline sales (0-1)
+    'coverage_x_share',              # Interaction: coverage * share (dilution signal)
+]
+
 # Cluster-specific features (only for cluster-level models)
 CLUSTER_SPECIFIC_FEATURES = [
     'num_items_in_cluster',  # Size of cluster (helps differentiate single-item vs multi-item clusters)
